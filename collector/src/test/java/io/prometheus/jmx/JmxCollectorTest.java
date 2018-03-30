@@ -1,7 +1,6 @@
 package io.prometheus.jmx;
 
 import static org.junit.Assert.assertEquals;
-import static org.junit.Assert.assertTrue;
 import static org.junit.Assert.assertNotNull;
 import static org.junit.Assert.assertNull;
 import static org.junit.Assert.fail;
@@ -10,7 +9,6 @@ import io.prometheus.client.Collector;
 import io.prometheus.client.CollectorRegistry;
 import java.lang.management.ManagementFactory;
 import javax.management.MBeanServer;
-import javax.management.ObjectName;
 import org.junit.Test;
 import org.junit.Before;
 import org.junit.BeforeClass;
@@ -233,4 +231,17 @@ public class JmxCollectorTest {
       assertEquals(0.001, registry.getSampleValue("foo", new String[]{}, new String[]{}), .001);
     }
 
+    @Test(expected=IllegalStateException.class)
+    public void testDelayedStartNotReady() throws Exception {
+      JmxCollector jc = new JmxCollector("---\nstartDelaySeconds: 1").register(registry);
+      assertNull(registry.getSampleValue("boolean_Test_True", new String[]{}, new String[]{}));
+      fail();
+    }
+
+    @Test
+    public void testDelayedStartReady() throws Exception {
+      JmxCollector jc = new JmxCollector("---\nstartDelaySeconds: 1").register(registry);
+      Thread.sleep(2000);
+      assertEquals(1.0, registry.getSampleValue("boolean_Test_True", new String[]{}, new String[]{}), .001);
+    }
 }

@@ -2,31 +2,31 @@ package io.prometheus.jmx;
 
 import io.prometheus.client.Collector;
 import io.prometheus.client.Counter;
-import java.io.IOException;
-import java.io.PrintWriter;
+import org.yaml.snakeyaml.Yaml;
+
+import javax.management.MalformedObjectNameException;
+import javax.management.ObjectName;
 import java.io.File;
 import java.io.FileReader;
+import java.io.IOException;
+import java.io.PrintWriter;
 import java.io.StringWriter;
 import java.util.ArrayList;
+import java.util.HashMap;
 import java.util.Iterator;
 import java.util.LinkedHashMap;
 import java.util.LinkedList;
 import java.util.List;
-import java.util.HashMap;
 import java.util.Map;
 import java.util.Set;
 import java.util.TreeMap;
 import java.util.logging.Logger;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
-import javax.management.MalformedObjectNameException;
-import javax.management.ObjectName;
-
-import org.yaml.snakeyaml.Yaml;
 
 import static java.lang.String.format;
 
-public class JmxCollector extends Collector {
+public class JmxCollector extends Collector implements Collector.Describable {
     static final Counter configReloadSuccess = Counter.build()
       .name("jmx_config_reload_success_total")
       .help("Number of times configuration have successfully been reloaded.").register();
@@ -44,12 +44,13 @@ public class JmxCollector extends Collector {
       Double valueFactor = 1.0;
       String help;
       boolean attrNameSnakeCase;
-      Type type = Type.GAUGE;
+      Type type = Type.UNTYPED;
       ArrayList<String> labelNames;
       ArrayList<String> labelValues;
     }
 
     private static class Config {
+      Integer startDelaySeconds = 0;
       String jmxUrl = "";
       String username = "";
       String password = "";
@@ -58,14 +59,15 @@ public class JmxCollector extends Collector {
       boolean lowercaseOutputLabelNames;
       List<ObjectName> whitelistObjectNames = new ArrayList<ObjectName>();
       List<ObjectName> blacklistObjectNames = new ArrayList<ObjectName>();
-      ArrayList<Rule> rules = new ArrayList<Rule>();
+      List<Rule> rules = new ArrayList<Rule>();
       long lastUpdate = 0L;
     }
 
     private Config config;
     private File configFile;
+    private long createTimeNanoSecs = System.nanoTime();
 
-    private static final Pattern snakeCasePattern = Pattern.compile("([a-z0-9])([A-Z])");
+    private final JmxMBeanPropertyCache jmxMBeanPropertyCache = new JmxMBeanPropertyCache();
 
     public JmxCollector(File in) throws IOException, MalformedObjectNameException {
         configFile = in;
@@ -106,6 +108,13 @@ public class JmxCollector extends Collector {
           yamlConfig = new HashMap<String, Object>();
         }
 
+        if (yamlConfig.containsKey("startDelaySeconds")) {
+          try {
+            cfg.startDelaySeconds = (Integer) yamlConfig.get("startDelaySeconds");
+          } catch (NumberFormatException e) {
+            throw new IllegalArgumentException("Invalid number provided for startDelaySeconds", e);
+          }
+        }
         if (yamlConfig.containsKey("hostPort")) {
           if (yamlConfig.containsKey("jmxUrl")) {
             throw new IllegalArgumentException("At most one of hostPort and jmxUrl must be provided");
@@ -158,7 +167,7 @@ public class JmxCollector extends Collector {
             Rule rule = new Rule();
             cfg.rules.add(rule);
             if (yamlRule.containsKey("pattern")) {
-              rule.pattern = Pattern.compile("^.*" + (String)yamlRule.get("pattern") + ".*$");
+              rule.pattern = Pattern.compile("^.*(?:" + (String)yamlRule.get("pattern") + ").*$");
             }
             if (yamlRule.containsKey("name")) {
               rule.name = (String)yamlRule.get("name");
@@ -210,23 +219,64 @@ public class JmxCollector extends Collector {
 
     }
 
+    static String toSnakeAndLowerCase(String attrName) {
+      if (attrName == null || attrName.isEmpty()) {
+        return attrName;
+      }
+      char firstChar = attrName.subSequence(0, 1).charAt(0);
+      boolean prevCharIsUpperCaseOrUnderscore = Character.isUpperCase(firstChar) || firstChar == '_';
+      StringBuilder resultBuilder = new StringBuilder(attrName.length()).append(Character.toLowerCase(firstChar));
+      for (char attrChar : attrName.substring(1).toCharArray()) {
+        boolean charIsUpperCase = Character.isUpperCase(attrChar);
+        if (!prevCharIsUpperCaseOrUnderscore && charIsUpperCase) {
+          resultBuilder.append("_");
+        }
+        resultBuilder.append(Character.toLowerCase(attrChar));
+        prevCharIsUpperCaseOrUnderscore = charIsUpperCase || attrChar == '_';
+      }
+      return resultBuilder.toString();
+    }
+
+  /**
+   * Change invalid chars to underscore, and merge underscores.
+   * @param name Input string
+   * @return
+   */
+  static String safeName(String name) {
+      if (name == null) {
+        return null;
+      }
+      boolean prevCharIsUnderscore = false;
+      StringBuilder safeNameBuilder = new StringBuilder(name.length());
+      for (char nameChar : name.toCharArray()) {
+        boolean isUnsafeChar = !(Character.isLetterOrDigit(nameChar) || nameChar == ':' || nameChar == '_');
+        if ((isUnsafeChar || nameChar == '_')) {
+          if (prevCharIsUnderscore) {
+            continue;
+          } else {
+            safeNameBuilder.append("_");
+            prevCharIsUnderscore = true;
+          }
+        } else {
+          safeNameBuilder.append(nameChar);
+          prevCharIsUnderscore = false;
+        }
+      }
+
+      return safeNameBuilder.toString();
+    }
+
     class Receiver implements JmxScraper.MBeanReceiver {
       Map<String, MetricFamilySamples> metricFamilySamplesMap =
         new HashMap<String, MetricFamilySamples>();
 
       private static final char SEP = '_';
 
-      private final Pattern unsafeChars = Pattern.compile("[^a-zA-Z0-9:_]");
-      private final Pattern multipleUnderscores = Pattern.compile("__+");
+
 
       // [] and () are special in regexes, so swtich to <>.
       private String angleBrackets(String s) {
         return "<" + s.substring(1, s.length() - 1) + ">";
-      }
-
-      private String safeName(String s) {
-        // Change invalid chars to underscore, and merge underscores.
-        return multipleUnderscores.matcher(unsafeChars.matcher(s).replaceAll("_")).replaceAll("_");
       }
 
       void addSample(MetricFamilySamples.Sample sample, Type type, String help) {
@@ -245,9 +295,9 @@ public class JmxCollector extends Collector {
           LinkedHashMap<String, String> beanProperties,
           LinkedList<String> attrKeys,
           String attrName,
-          String attrType,
           String help,
-          Object value) {
+          Object value,
+          Type type) {
         StringBuilder name = new StringBuilder();
         name.append(domain);
         if (beanProperties.size() > 0) {
@@ -284,7 +334,7 @@ public class JmxCollector extends Collector {
         }
 
         addSample(new MetricFamilySamples.Sample(fullname, labelNames, labelValues, ((Number)value).doubleValue()),
-          Type.GAUGE, help);
+          type, help);
       }
 
       public void recordBean(
@@ -299,7 +349,7 @@ public class JmxCollector extends Collector {
         String beanName = domain + angleBrackets(beanProperties.toString()) + angleBrackets(attrKeys.toString());
         // attrDescription tends not to be useful, so give the fully qualified name too.
         String help = attrDescription + " (" + beanName + attrName + ")";
-        String attrNameSnakeCase = snakeCasePattern.matcher(attrName).replaceAll("$1_$2").toLowerCase();
+        String attrNameSnakeCase = toSnakeAndLowerCase(attrName);
 
         for (Rule rule : config.rules) {
           Matcher matcher = null;
@@ -333,7 +383,7 @@ public class JmxCollector extends Collector {
 
           // If there's no name provided, use default export format.
           if (rule.name == null) {
-            defaultExport(domain, beanProperties, attrKeys, rule.attrNameSnakeCase ? attrNameSnakeCase : attrName, attrType, help, value);
+            defaultExport(domain, beanProperties, attrKeys, rule.attrNameSnakeCase ? attrNameSnakeCase : attrName, help, value, rule.type);
             return;
           }
 
@@ -394,9 +444,14 @@ public class JmxCollector extends Collector {
       }
 
       Receiver receiver = new Receiver();
-      JmxScraper scraper = new JmxScraper(config.jmxUrl, config.username, config.password, config.ssl, config.whitelistObjectNames, config.blacklistObjectNames, receiver);
+      JmxScraper scraper = new JmxScraper(config.jmxUrl, config.username, config.password, config.ssl,
+              config.whitelistObjectNames, config.blacklistObjectNames, receiver, jmxMBeanPropertyCache);
       long start = System.nanoTime();
       double error = 0;
+      if ((config.startDelaySeconds > 0) &&
+        ((start - createTimeNanoSecs) / 1000000000L < config.startDelaySeconds)) {
+        throw new IllegalStateException("JMXCollector waiting for startDelaySeconds");
+      }
       try {
         scraper.doScrape();
       } catch (Exception e) {
@@ -417,6 +472,13 @@ public class JmxCollector extends Collector {
           "jmx_scrape_error", new ArrayList<String>(), new ArrayList<String>(), error));
       mfsList.add(new MetricFamilySamples("jmx_scrape_error", Type.GAUGE, "Non-zero if this scrape failed.", samples));
       return mfsList;
+    }
+
+    public List<MetricFamilySamples> describe() {
+      List<MetricFamilySamples> sampleFamilies = new ArrayList<MetricFamilySamples>();
+      sampleFamilies.add(new MetricFamilySamples("jmx_scrape_duration_seconds", Type.GAUGE, "Time this JMX scrape took, in seconds.", new ArrayList<MetricFamilySamples.Sample>()));
+      sampleFamilies.add(new MetricFamilySamples("jmx_scrape_error", Type.GAUGE, "Non-zero if this scrape failed.", new ArrayList<MetricFamilySamples.Sample>()));
+      return sampleFamilies;
     }
 
     /**
